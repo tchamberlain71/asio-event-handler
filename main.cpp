@@ -1,117 +1,218 @@
-#include <boost/asio.hpp>
-#include <fmt/core.h>
+#include <azmq/socket.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/signal_set.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <spdlog/spdlog.h>
 
-using namespace std::literals;
+#include <expected>
 
-struct publisher {
-    std::chrono::milliseconds duration{};
+namespace {
+struct Subscriber {
+    azmq::sub_socket socket;
 
-    boost::asio::awaitable<void> send(std::string_view msg)
+    auto async_recv() -> boost::asio::awaitable<std::expected<std::string, std::string>>
     {
-        std::this_thread::sleep_for(duration);
-        fmt::print("sent: {}\n", msg);
-        co_return;
+        std::array<char, 4096> buffer;
+        try
+        {
+            std::size_t bytes_received = co_await azmq::async_receive(socket, boost::asio::buffer(buffer), boost::asio::use_awaitable);
+            co_return std::string(buffer.data(), bytes_received);
+        }
+        catch (const boost::system::system_error& e)
+        {
+            const boost::system::error_code& ec = e.code();
+            co_return std::unexpected(ec.message());
+        }
     }
 };
 
-struct subscriber {
-    std::chrono::milliseconds duration{};
+auto create_sub_socket(boost::asio::io_context& io_context, std::string addr, std::string topic) -> std::expected<azmq::sub_socket, std::string>
+{
+    static constexpr bool optimize_single_threaded = true;
+    azmq::sub_socket socket{io_context, optimize_single_threaded};
 
-    template<typename T>
-    boost::asio::awaitable<void> recv(T& t)
+    boost::system::error_code ec;
+    if (socket.connect(addr, ec))
     {
-        std::this_thread::sleep_for(duration);
-        t = T{};
-        co_return;
+        return std::unexpected(ec.message());
+    }
+    if (socket.set_option(azmq::socket::subscribe(topic), ec))
+    {
+        return std::unexpected(ec.message());
+    }
+
+    return socket;
+}
+
+struct Publisher {
+    azmq::pub_socket socket;
+    std::string topic;
+
+    auto async_send(std::string msg) -> boost::asio::awaitable<std::optional<std::string>>
+    {
+        try
+        {
+            co_await azmq::async_send(
+                socket,
+                boost::asio::buffer(topic + msg),
+                boost::asio::use_awaitable);
+            co_return std::nullopt;
+        }
+        catch (const boost::system::system_error& e)
+        {
+            const boost::system::error_code& ec = e.code();
+            co_return ec.message();
+        }
     }
 };
 
-struct other_service {
-    std::chrono::milliseconds duration{};
-    std::string msg{};
+auto create_pub_socket(boost::asio::io_context& io_context, std::string addr) -> std::expected<azmq::pub_socket, std::string>
+{
+    static constexpr bool optimize_single_threaded = true;
+    azmq::pub_socket socket{io_context, optimize_single_threaded};
 
-    boost::asio::awaitable<std::string> request()
+    boost::system::error_code ec;
+    if (socket.bind(addr, ec))
     {
-        std::this_thread::sleep_for(duration);
-        co_return msg;
+        return std::unexpected(ec.message());
+    }
+
+    return socket;
+}
+
+struct Model {
+    Subscriber sub1;
+    Subscriber sub2;
+    Publisher pub;
+};
+
+struct Event_handler {
+    Model& model;
+
+    boost::asio::awaitable<void> process(std::string msg)
+    {
+        spdlog::info("recv: {}", msg);
+
+        // do blocking work
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+
+        if (auto result = co_await model.pub.async_send(msg); result)
+        {
+            spdlog::error(*result);
+        }
+
+        spdlog::info("sent: {}", std::move(msg));
     }
 };
 
-struct model {
-    publisher pub{};
-    subscriber sub1{};
-    subscriber sub2{};
-    other_service service{};
-};
-
-struct msg_1 {
-};
-struct msg_2 {
-};
-
-struct event_handler {
-    model& m;
-
-    boost::asio::awaitable<void> process(msg_1)
-    {
-        thread_local int count = 0;
-        fmt::print("recv: msg_1 {}\n", ++count);
-        auto request = co_await m.service.request();
-        fmt::print("recv: for msg_1: {} {}\n", request, count);
-        co_await m.pub.send(fmt::format("msg_1 {}", count));
-    }
-
-    boost::asio::awaitable<void> process(msg_2)
-    {
-        thread_local int count = 0;
-        fmt::print("recv: msg_2 {}\n", ++count);
-        auto request = co_await m.service.request();
-        fmt::print("recv: for msg_2: {} {}\n", request, count);
-        co_await m.pub.send(fmt::format("msg_2 {}", count));
-    }
-};
-
-template<typename T>
-boost::asio::awaitable<void> receive_messages(std::stop_token stop_token, subscriber& sub, event_handler& handler)
+boost::asio::awaitable<void> receive_messages(std::stop_token stop_token, Subscriber& sub, Event_handler& handler)
 {
     while (!stop_token.stop_requested())
     {
-        T msg;
-        co_await sub.recv(msg);
-        co_await handler.process(msg);
+        auto msg = co_await sub.async_recv();
+
+        if (!msg)
+        {
+            spdlog::error(msg.error());
+            continue;
+        }
+
+        co_await handler.process(std::move(*msg));
     }
 }
+}// namespace
 
 int main()
 {
-    boost::asio::thread_pool pool{4};
+    boost::asio::io_context io_context;
     std::stop_source stop_source;
 
-    boost::asio::signal_set signals{pool, SIGINT, SIGTERM};
-    signals.async_wait([&pool, &stop_source](const auto&, auto) {
-        fmt::print("signal caught!\n");
+    boost::asio::signal_set signals(io_context, SIGINT, SIGTERM);
+    signals.async_wait([&io_context, &stop_source](const auto&, auto) {
+        spdlog::info("signal caught!");
         stop_source.request_stop();
-        pool.stop();
+        io_context.stop();
     });
 
-    model m{
-        .pub{100ms},
-        .sub1{1s},
-        .sub2{3s},
-        .service{500ms, "reqested msg"},
+    auto sub1 = create_sub_socket(io_context, "tcp://127.0.0.1:5556", "FOO");
+    if (!sub1)
+    {
+        spdlog::error(sub1.error());
+        return EXIT_FAILURE;
+    }
+
+    auto sub2 = create_sub_socket(io_context, "tcp://127.0.0.1:5557", "BAR");
+    if (!sub2)
+    {
+        spdlog::error(sub2.error());
+        return EXIT_FAILURE;
+    }
+
+    auto pub = create_pub_socket(io_context, "tcp://127.0.0.1:5558");
+    if (!pub)
+    {
+        spdlog::error(pub.error());
+        return EXIT_FAILURE;
+    }
+
+    Model model{
+        .sub1{std::move(*sub1)},
+        .sub2{std::move(*sub2)},
+        .pub{std::move(*pub), "TMP"},
     };
 
-    event_handler handler{m};
+    Event_handler handler{model};
 
     boost::asio::co_spawn(
-        pool,
-        [&stop_source, &m, &handler]() { return receive_messages<msg_1>(stop_source.get_token(), m.sub1, handler); },
+        io_context,
+        [&stop_source, &model, &handler]() { return receive_messages(stop_source.get_token(), model.sub1, handler); },
         boost::asio::detached);
 
     boost::asio::co_spawn(
-        pool,
-        [&stop_source, &m, &handler]() { return receive_messages<msg_2>(stop_source.get_token(), m.sub2, handler); },
+        io_context,
+        [&stop_source, &model, &handler]() { return receive_messages(stop_source.get_token(), model.sub2, handler); },
         boost::asio::detached);
 
-    pool.join();
+    ///////// start testing /////////
+    std::jthread([stop_token = stop_source.get_token()] {
+        boost::asio::io_context tester_io_context;
+        azmq::pub_socket test_pub{tester_io_context};
+        test_pub.bind("tcp://127.0.0.1:5556");
+        while (!stop_token.stop_requested())
+        {
+            std::this_thread::sleep_for(std::chrono::seconds{1});
+            test_pub.send(boost::asio::buffer(std::string{"FOOBAR"}));
+        }
+    }).detach();
+
+    std::jthread([stop_token = stop_source.get_token()] {
+        boost::asio::io_context tester_io_context;
+        azmq::pub_socket test_pub{tester_io_context};
+        test_pub.bind("tcp://127.0.0.1:5557");
+        while (!stop_token.stop_requested())
+        {
+            std::this_thread::sleep_for(std::chrono::seconds{3});
+            test_pub.send(boost::asio::buffer(std::string{"BARFOO"}));
+        }
+    }).detach();
+
+    std::jthread([stop_token = stop_source.get_token()] {
+        boost::asio::io_context tester_io_context;
+        azmq::sub_socket test_sub{tester_io_context};
+        test_sub.connect("tcp://127.0.0.1:5558");
+        test_sub.set_option(azmq::socket::subscribe("TMP"));
+        while (!stop_token.stop_requested())
+        {
+            std::array<char, 256> buf;
+            std::size_t size = test_sub.receive(boost::asio::buffer(buf));
+            spdlog::debug("recv: {}", std::string(buf.data(), size));
+        }
+    }).detach();
+    ///////// end testing /////////
+
+    io_context.run();
+
+    return EXIT_SUCCESS;
 }
